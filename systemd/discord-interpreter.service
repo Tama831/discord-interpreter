@@ -1,0 +1,19 @@
+[Unit]
+Description=Discord Interpreter Bot (ja<->en realtime voice translator)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 環境に合わせて User= と Path を調整
+User=tama
+WorkingDirectory=/home/tama/discord-interpreter
+EnvironmentFile=/home/tama/discord-interpreter/.env
+ExecStart=/home/tama/discord-interpreter/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
