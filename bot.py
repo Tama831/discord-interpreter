@@ -54,7 +54,13 @@ class InterpreterBot(commands.Bot):
         intents.voice_states = True
         intents.guilds = True
         intents.members = True  # ユーザー名取得用
-        super().__init__(command_prefix="!", intents=intents)
+        # 🔒 翻訳結果に「@everyone」「@here」「@役職名」「@ユーザー」が混入しても
+        # Discord 側で実際の通知に展開させない (Gemini 出力の安全網)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
         self.config = config
         self.translator = Translator(config.gemini_api_key, config.gemini_model)
