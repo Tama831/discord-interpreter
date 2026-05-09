@@ -85,11 +85,37 @@ class InterpreterBot(commands.Bot):
             if text_channel is None:
                 return False, "対応するテキストチャンネルが見つかりませんでした。"
 
+            # 過去 session の残骸 voice_client を強制 cleanup (handshake 失敗で leak することがある)
+            existing_vc = vc_channel.guild.voice_client
+            if existing_vc is not None:
+                logger.warning(
+                    "leaked voice_client を発見、強制 disconnect: %s", existing_vc
+                )
+                try:
+                    await existing_vc.disconnect(force=True)
+                except Exception:
+                    logger.exception("leaked voice_client cleanup 失敗")
+                await asyncio.sleep(0.5)
+
+            # 接続 (timeout を明示) + handshake 安定待ち
             try:
-                voice_client = await vc_channel.connect(reconnect=True)
+                voice_client = await vc_channel.connect(timeout=20.0, reconnect=True)
             except Exception as exc:
                 logger.exception("VC 接続失敗")
                 return False, f"VC 接続に失敗しました: {exc}"
+
+            # voice handshake が落ち着くまで少し待つ (4006 race 対策)
+            for _ in range(20):
+                if voice_client.is_connected():
+                    break
+                await asyncio.sleep(0.1)
+            if not voice_client.is_connected():
+                logger.error("voice_client が ready にならない")
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                return False, "voice handshake が確立しませんでした。少し待って再試行してください。"
 
             loop = asyncio.get_running_loop()
 
@@ -109,7 +135,16 @@ class InterpreterBot(commands.Bot):
                 # (実際のクリーンアップは end_session 側で同期的に実行済み)
                 pass
 
-            voice_client.start_recording(sink, _on_recording_finished, text_channel)
+            try:
+                voice_client.start_recording(sink, _on_recording_finished, text_channel)
+            except Exception as exc:
+                logger.exception("start_recording 失敗、voice_client を片付け")
+                await sink.stop_watcher()
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                return False, f"録音開始に失敗しました: {exc}"
 
             self.sessions[vc_channel.id] = InterpreterSession(
                 voice_channel=vc_channel,
@@ -128,7 +163,19 @@ class InterpreterBot(commands.Bot):
     async def end_session(self, vc_channel_id: int) -> tuple[bool, str]:
         async with self._sessions_lock:
             session = self.sessions.pop(vc_channel_id, None)
+
         if not session:
+            # session が無くても、guild に bot の voice_client が残ってたら強制 disconnect
+            # (前回 /interpret on で start_recording が落ちた時の残骸を救出する用)
+            channel = self.get_channel(vc_channel_id)
+            guild = channel.guild if channel else None
+            if guild and guild.voice_client is not None:
+                logger.warning("session 無しだが voice_client 残骸を発見、disconnect")
+                try:
+                    await guild.voice_client.disconnect(force=True)
+                except Exception:
+                    logger.exception("残骸 disconnect 失敗")
+                return True, "残っていた接続をクリーンアップしました。再度 `/interpret on` をどうぞ。"
             return False, "このチャンネルでは翻訳が動いていません。"
 
         try:
