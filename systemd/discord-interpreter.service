@@ -5,11 +5,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# 環境に合わせて User= と Path を調整
-User=tama
-WorkingDirectory=/home/tama/discord-interpreter
-EnvironmentFile=/home/tama/discord-interpreter/.env
-ExecStart=/home/tama/discord-interpreter/.venv/bin/python bot.py
+# === 環境に合わせて以下 4 行を編集してください ===
+# User=                   ... bot を実行する Linux ユーザー (root 以外推奨)
+# WorkingDirectory=       ... clone したリポのパス
+# EnvironmentFile=        ... .env のパス (リポ直下を推奨)
+# ExecStart=              ... .venv の python を絶対パスで指定
+User=CHANGE_ME
+WorkingDirectory=/path/to/discord-interpreter
+EnvironmentFile=/path/to/discord-interpreter/.env
+ExecStart=/path/to/discord-interpreter/.venv/bin/python bot.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
