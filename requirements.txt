@@ -1,4 +1,6 @@
-py-cord[voice]==2.6.1
+# py-cord 2.7.2+ required: 2.6.x doesn't support Discord Voice Gateway v8 AEAD
+# encryption (Nov 2024 deprecation), causing WS code 4006 immediately after handshake
+py-cord[voice]>=2.7.2
 google-genai>=0.3.0
 python-dotenv>=1.0.0
 PyNaCl>=1.5.0
