@@ -55,16 +55,15 @@ class InterpreterBot(commands.Bot):
         self._daily_reset_at = time.time()
 
     async def on_ready(self) -> None:
-        logger.info("bot ready as %s (id=%s)", self.user, self.user.id if self.user else "?")
-        try:
-            if self.config.guild_id:
-                guild_obj = discord.Object(id=self.config.guild_id)
-                synced = await self.tree.sync(guild=guild_obj)
-            else:
-                synced = await self.tree.sync()
-            logger.info("synced %d slash commands", len(synced))
-        except Exception:
-            logger.exception("slash command sync 失敗")
+        # pycord は create_group / slash_command デコレータで登録した command を
+        # 起動時に auto-sync する (discord.py の bot.tree.sync() 相当は不要)。
+        # guild_ids を渡しているので guild-scoped commands として即時反映。
+        logger.info(
+            "bot ready as %s (id=%s, guilds=%d)",
+            self.user, self.user.id if self.user else "?", len(self.guilds),
+        )
+        for g in self.guilds:
+            logger.info("  - guild: %s (id=%s)", g.name, g.id)
 
     # ----- セッション操作 -------------------------------------------------
 
