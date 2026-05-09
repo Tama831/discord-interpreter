@@ -16,6 +16,33 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
+# === py-cord 2.7.2 voice gateway v8 IDENTIFY パッチ ===
+# Discord voice gateway v8 (2024-11〜) は IDENTIFY に max_dave_protocol_version を要求するが、
+# py-cord 2.7.2 はまだこのフィールドを送らないため WS code 4017 で蹴られる。
+# master branch には fix 入っているが pip 経由で release 待ち。
+import discord.gateway as _dg
+
+_orig_voice_identify = _dg.DiscordVoiceWebSocket.identify
+
+
+async def _patched_voice_identify(self):
+    state = self._connection
+    payload = {
+        "op": self.IDENTIFY,
+        "d": {
+            "server_id": str(state.server_id),
+            "user_id": str(state.user.id),
+            "session_id": state.session_id,
+            "token": state.token,
+            "max_dave_protocol_version": 0,  # DAVE 無効、最低限 v8 を満たす
+        },
+    }
+    await self.send_as_json(payload)
+
+
+_dg.DiscordVoiceWebSocket.identify = _patched_voice_identify
+# === end patch ===
+
 from channel_mapper import find_paired_text_channel, normalize_channel_name
 from config import Config, setup_logging
 from translator import Translator, TranslationResult
