@@ -1,12 +1,11 @@
-"""pycord の Sink を継承し、ユーザーごとに PCM をバッファリングして
-"無音 N 秒" で発話単位に切り出すカスタム sink。
+"""discord-ext-voice-recv の AudioSink を継承し、ユーザーごとに PCM を
+バッファリングして "無音 N 秒" で発話単位に切り出すカスタム sink。
 
-Discord の audio packet は 20ms 単位で来るが、pycord は デコード済 PCM
-(48kHz/stereo/16bit) を Sink.write(data, user) 経由で同期スレッドから渡してくる。
-
-- write() は pycord の voice receiver スレッドから呼ばれる (asyncio ループ外)
-- なのでバッファ操作は lock で保護
-- 無音検出と Gemini 呼び出しは asyncio タスクで非同期に実行
+discord.py + voice_recv 拡張の場合:
+- write(user, data) が voice receiver スレッドから呼ばれる
+- data.pcm は デコード済 PCM (48kHz/stereo/16bit) の 20ms フレーム
+- data.source は User (None の可能性あり)
+- バッファ操作は lock で保護、無音検出と Gemini 呼び出しは asyncio で非同期実行
 """
 from __future__ import annotations
 
@@ -15,10 +14,10 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 
 import discord
-from discord.sinks import Sink
+from discord.ext import voice_recv
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +26,8 @@ logger = logging.getLogger(__name__)
 ChunkHandler = Callable[[int, bytes], Awaitable[None]]
 
 
-class StreamingTranslatorSink(Sink):
+class StreamingTranslatorSink(voice_recv.AudioSink):
     """発話単位で PCM チャンクを切り出すリアルタイム sink。"""
-
-    # discord.sinks.Sink は filters に container_type を要求しない
-    # WaveSink 等のファイル sink と違って、自分で write() を捌く
 
     def __init__(
         self,
@@ -69,24 +65,32 @@ class StreamingTranslatorSink(Sink):
                 pass
         await self._flush_all()
 
-    # --- pycord Sink overrides --------------------------------------------
+    # --- voice_recv.AudioSink overrides -----------------------------------
 
-    def write(self, data: bytes, user: int) -> None:  # noqa: D401 - sink contract
+    def wants_opus(self) -> bool:
+        # PCM が欲しい (Gemini に WAV で渡すため)
+        return False
+
+    def write(self, user: Optional[discord.User], data: voice_recv.VoiceData) -> None:
         """voice receiver スレッドから 20ms PCM が届く。バッファに足すだけ。"""
-        if self._closed or not user:
+        if self._closed or user is None or user.bot:
             return
+        pcm = data.pcm
+        if not pcm:
+            return
+        user_id = user.id
         with self._lock:
-            buf = self._buffers[user]
-            buf.extend(data)
-            self._last_write[user] = time.monotonic()
+            buf = self._buffers[user_id]
+            buf.extend(pcm)
+            self._last_write[user_id] = time.monotonic()
             if len(buf) >= self._max_chunk_bytes:
                 # 上限到達 → スレッドセーフに即フラッシュ
-                pcm = bytes(buf)
+                pcm_chunk = bytes(buf)
                 buf.clear()
-                self._dispatch(user, pcm)
+                self._dispatch(user_id, pcm_chunk)
 
-    def cleanup(self) -> None:  # pycord が stop_recording 時に呼ぶ
-        # 同期的なので flush は次の機会に任せる
+    def cleanup(self) -> None:
+        # voice_recv が listen 停止時に呼ぶ。同期的なので flush は次の機会に。
         return
 
     # --- internal ----------------------------------------------------------
@@ -119,7 +123,6 @@ class StreamingTranslatorSink(Sink):
                             if buf:
                                 to_flush.append((user_id, bytes(buf)))
                                 buf.clear()
-                            # last_write はクリアしておく (再発話時に再記録)
                             self._last_write.pop(user_id, None)
                 for user_id, pcm in to_flush:
                     self._dispatch(user_id, pcm)

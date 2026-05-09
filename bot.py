@@ -4,6 +4,11 @@
 - /interpret on   ... 自分が今いる VC に bot を呼んで翻訳開始
 - /interpret off  ... その VC の翻訳を停止 (bot 退室)
 - /interpret status ... 全 VC の現在状態
+
+ライブラリ選定 (2026-05-09 切替): py-cord → discord.py 2.7.1 + discord-ext-voice-recv
+理由: Discord が 2026-03-02 に DAVE (E2E voice encryption) を全面強制化、
+py-cord は未対応 (close code 4017)、discord.py 2.7.0 は対応済。
+voice receive は discord.py 本体に無いので imayhaveborkedit/discord-ext-voice-recv を併用。
 """
 from __future__ import annotations
 
@@ -13,35 +18,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+# DAVE 復号パッチを voice_recv import 前に必ず適用すること
+import dave_patch
+dave_patch.apply()
+
 import discord
-from discord.ext import commands
-
-# === py-cord 2.7.2 voice gateway v8 IDENTIFY パッチ ===
-# Discord voice gateway v8 (2024-11〜) は IDENTIFY に max_dave_protocol_version を要求するが、
-# py-cord 2.7.2 はまだこのフィールドを送らないため WS code 4017 で蹴られる。
-# master branch には fix 入っているが pip 経由で release 待ち。
-import discord.gateway as _dg
-
-_orig_voice_identify = _dg.DiscordVoiceWebSocket.identify
-
-
-async def _patched_voice_identify(self):
-    state = self._connection
-    payload = {
-        "op": self.IDENTIFY,
-        "d": {
-            "server_id": str(state.server_id),
-            "user_id": str(state.user.id),
-            "session_id": state.session_id,
-            "token": state.token,
-            "max_dave_protocol_version": 0,  # DAVE 無効、最低限 v8 を満たす
-        },
-    }
-    await self.send_as_json(payload)
-
-
-_dg.DiscordVoiceWebSocket.identify = _patched_voice_identify
-# === end patch ===
+from discord import app_commands
+from discord.ext import commands, voice_recv
 
 from channel_mapper import find_paired_text_channel, normalize_channel_name
 from config import Config, setup_logging
@@ -58,7 +41,7 @@ logger = logging.getLogger(__name__)
 class InterpreterSession:
     voice_channel: discord.VoiceChannel
     text_channel: discord.abc.Messageable
-    voice_client: discord.VoiceClient
+    voice_client: voice_recv.VoiceRecvClient
     sink: StreamingTranslatorSink
     started_at: float = field(default_factory=time.time)
     chunks_processed: int = 0
@@ -81,10 +64,20 @@ class InterpreterBot(commands.Bot):
         self._daily_cost_usd = 0.0
         self._daily_reset_at = time.time()
 
+    async def setup_hook(self) -> None:
+        # discord.py 2.x は app_commands を明示的に sync する必要がある
+        try:
+            if self.config.guild_id:
+                guild_obj = discord.Object(id=self.config.guild_id)
+                self.tree.copy_global_to(guild=guild_obj)
+                synced = await self.tree.sync(guild=guild_obj)
+            else:
+                synced = await self.tree.sync()
+            logger.info("synced %d slash commands", len(synced))
+        except Exception:
+            logger.exception("slash command sync 失敗")
+
     async def on_ready(self) -> None:
-        # pycord は create_group / slash_command デコレータで登録した command を
-        # 起動時に auto-sync する (discord.py の bot.tree.sync() 相当は不要)。
-        # guild_ids を渡しているので guild-scoped commands として即時反映。
         logger.info(
             "bot ready as %s (id=%s, guilds=%d)",
             self.user, self.user.id if self.user else "?", len(self.guilds),
@@ -112,26 +105,28 @@ class InterpreterBot(commands.Bot):
             if text_channel is None:
                 return False, "対応するテキストチャンネルが見つかりませんでした。"
 
-            # 過去 session の残骸 voice_client を強制 cleanup (handshake 失敗で leak することがある)
+            # 過去 session の残骸 voice_client を強制 cleanup
             existing_vc = vc_channel.guild.voice_client
             if existing_vc is not None:
-                logger.warning(
-                    "leaked voice_client を発見、強制 disconnect: %s", existing_vc
-                )
+                logger.warning("leaked voice_client を発見、強制 disconnect")
                 try:
                     await existing_vc.disconnect(force=True)
                 except Exception:
                     logger.exception("leaked voice_client cleanup 失敗")
                 await asyncio.sleep(0.5)
 
-            # 接続 (timeout を明示) + handshake 安定待ち
+            # voice_recv.VoiceRecvClient で接続 (DAVE 対応の discord.py 2.7+)
             try:
-                voice_client = await vc_channel.connect(timeout=20.0, reconnect=True)
+                voice_client = await vc_channel.connect(
+                    cls=voice_recv.VoiceRecvClient,
+                    timeout=20.0,
+                    reconnect=True,
+                )
             except Exception as exc:
                 logger.exception("VC 接続失敗")
                 return False, f"VC 接続に失敗しました: {exc}"
 
-            # voice handshake が落ち着くまで少し待つ (4006 race 対策)
+            # handshake 安定待ち
             for _ in range(20):
                 if voice_client.is_connected():
                     break
@@ -157,15 +152,10 @@ class InterpreterBot(commands.Bot):
             )
             sink.start_watcher()
 
-            def _on_recording_finished(_sink, *_args):
-                # pycord が stop_recording 時に呼ぶ。ここでは何もしない
-                # (実際のクリーンアップは end_session 側で同期的に実行済み)
-                pass
-
             try:
-                voice_client.start_recording(sink, _on_recording_finished, text_channel)
+                voice_client.listen(sink)
             except Exception as exc:
-                logger.exception("start_recording 失敗、voice_client を片付け")
+                logger.exception("listen 失敗、voice_client を片付け")
                 await sink.stop_watcher()
                 try:
                     await voice_client.disconnect(force=True)
@@ -192,8 +182,7 @@ class InterpreterBot(commands.Bot):
             session = self.sessions.pop(vc_channel_id, None)
 
         if not session:
-            # session が無くても、guild に bot の voice_client が残ってたら強制 disconnect
-            # (前回 /interpret on で start_recording が落ちた時の残骸を救出する用)
+            # 残骸 voice_client があれば cleanup
             channel = self.get_channel(vc_channel_id)
             guild = channel.guild if channel else None
             if guild and guild.voice_client is not None:
@@ -206,9 +195,9 @@ class InterpreterBot(commands.Bot):
             return False, "このチャンネルでは翻訳が動いていません。"
 
         try:
-            session.voice_client.stop_recording()
+            session.voice_client.stop_listening()
         except Exception:
-            logger.exception("stop_recording 失敗")
+            logger.exception("stop_listening 失敗")
         await session.sink.stop_watcher()
         try:
             await session.voice_client.disconnect(force=True)
@@ -255,7 +244,6 @@ class InterpreterBot(commands.Bot):
         session.estimated_cost_usd += cost
         self._daily_cost_usd += cost
 
-        # ユーザー情報
         guild = session.voice_channel.guild
         member = guild.get_member(user_id)
         name = member.display_name if member else f"user-{user_id}"
@@ -278,39 +266,42 @@ class InterpreterBot(commands.Bot):
             self._daily_reset_at = now
 
 
-# ----- スラッシュコマンド定義 ------------------------------------------------
+# ----- スラッシュコマンド (discord.py app_commands) -------------------------
 
 
 def register_commands(bot: InterpreterBot) -> None:
-    guild_kwargs = {}
-    if bot.config.guild_id:
-        guild_kwargs["guild_ids"] = [bot.config.guild_id]
-
-    interpret = bot.create_group(
-        "interpret",
-        "ボイスチャンネルの発話を日本語↔英語で翻訳",
-        **guild_kwargs,
+    interpret = app_commands.Group(
+        name="interpret",
+        description="ボイスチャンネルの発話を日本語↔英語で翻訳",
     )
 
     @interpret.command(name="on", description="今いる VC で翻訳を開始")
-    async def _on(ctx: discord.ApplicationContext):
-        await ctx.defer(ephemeral=True)
-        ok, msg = await bot.start_session(ctx.author)
-        await ctx.followup.send(msg, ephemeral=True)
+    async def _on(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send("サーバー内で実行してください。", ephemeral=True)
+            return
+        ok, msg = await bot.start_session(interaction.user)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @interpret.command(name="off", description="今いる VC で翻訳を停止")
-    async def _off(ctx: discord.ApplicationContext):
-        await ctx.defer(ephemeral=True)
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.followup.send("VC に入った状態で実行してください。", ephemeral=True)
+    async def _off(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.followup.send("サーバー内で実行してください。", ephemeral=True)
             return
-        ok, msg = await bot.end_session(ctx.author.voice.channel.id)
-        await ctx.followup.send(msg, ephemeral=True)
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.followup.send("VC に入った状態で実行してください。", ephemeral=True)
+            return
+        ok, msg = await bot.end_session(interaction.user.voice.channel.id)
+        await interaction.followup.send(msg, ephemeral=True)
 
     @interpret.command(name="status", description="現在翻訳中の VC 一覧")
-    async def _status(ctx: discord.ApplicationContext):
+    async def _status(interaction: discord.Interaction):
         if not bot.sessions:
-            await ctx.respond("今は翻訳セッションは動いていません。", ephemeral=True)
+            await interaction.response.send_message(
+                "今は翻訳セッションは動いていません。", ephemeral=True
+            )
             return
         lines = []
         for s in bot.sessions.values():
@@ -319,7 +310,11 @@ def register_commands(bot: InterpreterBot) -> None:
                 f"- `{s.voice_channel.name}` → <#{s.text_channel.id}> "
                 f"({mins:.1f}分 / {s.chunks_processed}発話 / ≈${s.estimated_cost_usd:.3f})"
             )
-        await ctx.respond("**翻訳中のセッション**\n" + "\n".join(lines), ephemeral=True)
+        await interaction.response.send_message(
+            "**翻訳中のセッション**\n" + "\n".join(lines), ephemeral=True
+        )
+
+    bot.tree.add_command(interpret)
 
 
 # ----- 自動退室 (VC が空になったら) ------------------------------------------
@@ -330,7 +325,6 @@ def register_voice_state_listener(bot: InterpreterBot) -> None:
     async def on_voice_state_update(member, before, after):
         if member.bot:
             return
-        # bot が居る VC で人間が 0 人になったら自動退室
         for vc_id, session in list(bot.sessions.items()):
             human_count = sum(1 for m in session.voice_channel.members if not m.bot)
             if human_count == 0:

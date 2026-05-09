@@ -1,6 +1,13 @@
-# py-cord 2.7.2+ required: 2.6.x doesn't support Discord Voice Gateway v8 AEAD
-# encryption (Nov 2024 deprecation), causing WS code 4006 immediately after handshake
-py-cord[voice]>=2.7.2
+# discord.py 2.7.0+ required for DAVE (E2E voice encryption) support.
+# Discord enforced DAVE globally on 2026-03-02; older versions hit close code 4017.
+# py-cord (the fork) doesn't support DAVE yet as of 2026-05-09 (PR #3143 merged but
+# release pending), so we use discord.py + the voice-recv extension instead.
+discord.py[voice]>=2.7.0
+discord-ext-voice-recv>=0.5.2a179
+# DAVE protocol library — needed for monkey-patch in dave_patch.py to decrypt
+# incoming voice packets (voice-recv 0.5.2a179 doesn't yet have native DAVE support;
+# patch follows https://github.com/imayhaveborkedit/discord-ext-voice-recv/pull/54)
+davey>=0.1.5
 google-genai>=0.3.0
 python-dotenv>=1.0.0
 PyNaCl>=1.5.0
