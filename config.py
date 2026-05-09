@@ -16,6 +16,7 @@ class Config:
     gemini_api_key: str
     gemini_model: str
     guild_id: int | None
+    allowed_guild_ids: frozenset[int]  # 空 = どこでも許可、非空 = 許可リスト方式
     chunk_max_seconds: float
     silence_timeout_seconds: float
     daily_budget_usd: float
@@ -30,11 +31,23 @@ class Config:
         if not key:
             raise RuntimeError("GEMINI_API_KEY が未設定です (.env を確認)")
         guild_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
+        # ALLOWED_GUILD_IDS は CSV (例 "111,222,333")。未設定なら DISCORD_GUILD_ID
+        # を allowlist として使う。両方未設定なら allowlist 無し (= 注意!)。
+        allowed_raw = os.getenv("ALLOWED_GUILD_IDS", "").strip()
+        if allowed_raw:
+            allowed_ids = frozenset(
+                int(x.strip()) for x in allowed_raw.split(",") if x.strip()
+            )
+        elif guild_raw:
+            allowed_ids = frozenset({int(guild_raw)})
+        else:
+            allowed_ids = frozenset()
         return cls(
             discord_bot_token=token,
             gemini_api_key=key,
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
             guild_id=int(guild_raw) if guild_raw else None,
+            allowed_guild_ids=allowed_ids,
             chunk_max_seconds=float(os.getenv("CHUNK_MAX_SECONDS", "8.0")),
             silence_timeout_seconds=float(os.getenv("SILENCE_TIMEOUT_SECONDS", "0.8")),
             daily_budget_usd=float(os.getenv("DAILY_BUDGET_USD", "2.0")),

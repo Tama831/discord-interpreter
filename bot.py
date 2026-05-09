@@ -84,6 +84,43 @@ class InterpreterBot(commands.Bot):
         )
         for g in self.guilds:
             logger.info("  - guild: %s (id=%s)", g.name, g.id)
+        # 起動時 sweep: 寝てる間に勝手に追加された unauthorized guild は退出
+        await self._enforce_guild_allowlist_sweep()
+
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        # 新規追加されたギルドが許可リストに無ければ即退出
+        if not self._is_allowed_guild(guild.id):
+            logger.warning(
+                "🚨 unauthorized guild join: %s (id=%s) — leaving immediately",
+                guild.name, guild.id,
+            )
+            try:
+                await guild.leave()
+            except Exception:
+                logger.exception("unauthorized guild からの退出失敗")
+
+    def _is_allowed_guild(self, guild_id: int) -> bool:
+        # allowlist が空なら全許可 (=後方互換、ただし警告ログを on_ready で出す)
+        if not self.config.allowed_guild_ids:
+            return True
+        return guild_id in self.config.allowed_guild_ids
+
+    async def _enforce_guild_allowlist_sweep(self) -> None:
+        if not self.config.allowed_guild_ids:
+            logger.warning(
+                "⚠️ ALLOWED_GUILD_IDS が空: 全ギルドで動作します。.env を確認してください"
+            )
+            return
+        for g in list(self.guilds):
+            if g.id not in self.config.allowed_guild_ids:
+                logger.warning(
+                    "🚨 startup sweep: unauthorized guild %s (id=%s) — leaving",
+                    g.name, g.id,
+                )
+                try:
+                    await g.leave()
+                except Exception:
+                    logger.exception("startup sweep 退出失敗")
 
     # ----- セッション操作 -------------------------------------------------
 
