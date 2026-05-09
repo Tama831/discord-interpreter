@@ -25,7 +25,6 @@ def apply() -> None:
         return
 
     from discord.ext.voice_recv import opus as _opus
-    from discord.ext.voice_recv import router as _router
     from discord.ext.voice_recv.opus import VoiceData
 
     _orig_init = _opus.PacketDecoder.__init__
@@ -93,26 +92,8 @@ def apply() -> None:
     _opus.PacketDecoder._process_packet = _patched_process_packet
     _opus.PacketDecoder._decode_packet = _patched_decode_packet
 
-    # router: source=None の data を sink に流すと user 不明エラーが出るので skip
-    _orig_do_run = _router.PacketRouter._do_run
-
-    def _patched_do_run(self):  # type: ignore[no-untyped-def]
-        # 元コードと同等だが data.source is None も skip
-        # (元実装は data is not None だけ見ていた)
-        while not self._end.is_set():
-            self.waiter.wait()
-            if self._end.is_set():
-                return
-            with self._lock:
-                for decoder in self.waiter.items:
-                    data = decoder.pop_data()
-                    if data is not None and data.source is not None:
-                        try:
-                            self.sink.write(data.source, data)
-                        except Exception:
-                            logger.exception("sink.write 失敗")
-            self.waiter.clear()
-
-    _router.PacketRouter._do_run = _patched_do_run
+    # 注: PR #54 の router 修正 (data.source is None skip) は本実装では不要。
+    # 我々の StreamingTranslatorSink.write() が `if user is None: return` で
+    # 弾くので、router 側で同じことをしなくても害はない。
 
     logger.info("DAVE decryption patch applied to discord-ext-voice-recv")
